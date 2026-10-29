@@ -6,6 +6,8 @@ from flask import Flask, request, render_template_string
 
 app = Flask(__name__)
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
+SHEET_URL = os.environ.get("SHEET_URL")
+SHEET_SECRET = os.environ.get("SHEET_SECRET")
 FILE = "web_orders.csv"
 
 PAGE = """
@@ -42,21 +44,42 @@ PAGE = """
 """
 
 def clean(value, limit):
-    value = (value or "").strip()[:limit]
-    # stop spreadsheet formula injection
+    return (value or "").strip()[:limit]
+
+def csv_safe(value):
+    # stop spreadsheet formula injection in the local CSV
     if value and value[0] in "=+-@":
-        value = "'" + value
+        return "'" + value
     return value
 
-def save_order(row):
-    new_file = not os.path.exists(FILE)
-    with open(FILE, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if new_file:
-            w.writerow(["time", "name", "contact", "item", "note", "status"])
-        w.writerow(row)
+def save_csv(name, contact, item, note):
+    try:
+        new_file = not os.path.exists(FILE)
+        with open(FILE, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(["time", "name", "contact", "item", "note", "status"])
+            w.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        csv_safe(name), csv_safe(contact), csv_safe(item), csv_safe(note), "New"])
+    except OSError:
+        print("Local CSV save failed")
 
-def send_alert(name, contact, item, note):
+def save_sheet(name, contact, item, note):
+    if not (SHEET_URL and SHEET_SECRET):
+        return None  # sheet not configured
+    try:
+        r = requests.post(
+            SHEET_URL,
+            json={"secret": SHEET_SECRET, "name": name, "contact": contact,
+                  "item": item, "note": note},
+            timeout=20,
+        )
+        r.raise_for_status()
+        return r.json().get("ok") is True
+    except (requests.RequestException, ValueError):
+        return False
+
+def send_alert(name, contact, item, note, sheet_ok):
     msg = (
         "🛒 New order\n"
         f"Name: {name}\n"
@@ -64,6 +87,8 @@ def send_alert(name, contact, item, note):
         f"Item: {item}\n"
         f"Note: {note or '-'}"
     )
+    if sheet_ok is False:
+        msg += "\n⚠️ Could not save to the sheet. Please note this order manually."
     requests.post(
         WEBHOOK_URL,
         json={"content": msg, "allowed_mentions": {"parse": []}},
@@ -79,9 +104,10 @@ def order():
         note = clean(request.form.get("note"), 500)
         if not (name and contact and item):
             return render_template_string(PAGE, error="Please fill in name, contact and item.")
-        save_order([datetime.now().strftime("%Y-%m-%d %H:%M"), name, contact, item, note, "New"])
+        save_csv(name, contact, item, note)
+        sheet_ok = save_sheet(name, contact, item, note)
         try:
-            send_alert(name, contact, item, note)
+            send_alert(name, contact, item, note, sheet_ok)
         except requests.RequestException:
             print("Alert failed, but the order was saved.")
         return render_template_string(PAGE, done=True)
